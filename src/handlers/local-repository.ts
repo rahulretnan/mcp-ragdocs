@@ -1,5 +1,5 @@
 import { McpError, ErrorCode } from '@modelcontextprotocol/sdk/types.js';
-import { BaseHandler } from './base-handler.js';
+import { BaseHandler, ProgressState } from './base-handler.js';
 import { DocumentChunk, McpToolResponse, RepositoryConfig, IndexingStatus } from '../types.js';
 import fs from 'fs/promises';
 import path from 'path';
@@ -17,7 +17,6 @@ const REPO_CONFIG_DIR = path.join(__dirname, '..', 'repo-configs');
 const DEFAULT_CHUNK_SIZE = 1000;
 
 export class LocalRepositoryHandler extends BaseHandler {
-  private activeProgressToken: string | number | undefined;
   private statusManager: IndexingStatusManager;
   // Track active indexing processes
   private static activeIndexingProcesses: Map<string, boolean> = new Map();
@@ -30,7 +29,7 @@ export class LocalRepositoryHandler extends BaseHandler {
   }
 
   async handle(args: any, callContext?: { progressToken?: string | number, requestId: string | number }): Promise<McpToolResponse> {
-    this.activeProgressToken = callContext?.progressToken || callContext?.requestId;
+    const progress: ProgressState = { token: callContext?.progressToken, last: -1 };
 
     // Validate required parameters
     if (!args.path || typeof args.path !== 'string') {
@@ -116,15 +115,13 @@ export class LocalRepositoryHandler extends BaseHandler {
       const configLoader = new RepositoryConfigLoader(this.server, this.apiClient);
       await configLoader.addRepositoryToConfig(config);
       console.info(`[${config.name}] Repository configuration saved and loaded.`);
-      if (this.activeProgressToken) {
-        (this.server as any).sendProgress(this.activeProgressToken, { message: "Repository configuration saved." });
-      }
+      this.sendMonotonicProgress(progress);
 
       // Create initial status
       await this.statusManager.createStatus(config.name);
 
       // Start the indexing process asynchronously
-      this.processRepositoryAsync(config, this.activeProgressToken);
+      this.processRepositoryAsync(config, progress);
 
       return {
         content: [
@@ -153,7 +150,7 @@ export class LocalRepositoryHandler extends BaseHandler {
     }
   }
 
-  private async processRepository(config: RepositoryConfig): Promise<{
+  private async processRepository(config: RepositoryConfig, progress: ProgressState): Promise<{
     chunks: DocumentChunk[],
     processedFiles: number,
     skippedFiles: number
@@ -173,9 +170,6 @@ export class LocalRepositoryHandler extends BaseHandler {
     const totalFiles = files.length;
 
     console.info(`[${config.name}] Found ${totalFiles} files to process based on include/exclude patterns.`);
-    if (this.activeProgressToken) {
-      (this.server as any).sendProgress(this.activeProgressToken, { message: `Found ${totalFiles} files to process.` });
-    }
 
     for (const file of files) {
       fileCounter++;
@@ -214,14 +208,15 @@ export class LocalRepositoryHandler extends BaseHandler {
 
         chunks.push(...fileChunks);
         processedFiles++;
-        if (fileCounter % 50 === 0 && fileCounter > 0 && this.activeProgressToken) {
-          const percentageComplete = Math.round((fileCounter / totalFiles) * 33); // File processing is ~1/3 of the job
-          (this.server as any).sendProgress(this.activeProgressToken, { message: `Processed ${fileCounter} of ${totalFiles} files...`, percentageComplete });
-          console.info(`[${config.name}] Processed ${fileCounter} of ${totalFiles} files... (${processedFiles} successful, ${skippedFiles} skipped/errored)`);
-        }
       } catch (error) {
         console.error(`[${config.name}] Error processing file ${file}: ${error instanceof Error ? error.message : String(error)}`);
         skippedFiles++;
+      } finally {
+        if (fileCounter % 50 === 0) {
+          const percentageComplete = Math.round((fileCounter / totalFiles) * 33); // File processing is ~1/3 of the job
+          this.sendMonotonicProgress(progress, percentageComplete);
+          console.info(`[${config.name}] Processed ${fileCounter} of ${totalFiles} files... (${processedFiles} successful, ${skippedFiles} skipped/errored)`);
+        }
       }
     }
     console.info(`[${config.name}] Completed file iteration. Processed: ${processedFiles}, Skipped/Errored: ${skippedFiles}.`);
@@ -371,7 +366,7 @@ export class LocalRepositoryHandler extends BaseHandler {
   /**
    * Process repository asynchronously to avoid MCP timeout
    */
-  private async processRepositoryAsync(config: RepositoryConfig, progressToken?: string | number): Promise<void> {
+  private async processRepositoryAsync(config: RepositoryConfig, progress: ProgressState): Promise<void> {
     try {
       // Mark this repository as being processed
       LocalRepositoryHandler.activeIndexingProcesses.set(config.name, true);
@@ -385,7 +380,7 @@ export class LocalRepositoryHandler extends BaseHandler {
       console.info(`[${config.name}] Starting to process repository files asynchronously...`);
 
       // Process the repository files
-      const { chunks, processedFiles, skippedFiles } = await this.processRepository(config);
+      const { chunks, processedFiles, skippedFiles } = await this.processRepository(config, progress);
 
       // Update status with file processing results
       await this.statusManager.updateStatus({
@@ -468,6 +463,7 @@ export class LocalRepositoryHandler extends BaseHandler {
           }
 
           const percentageComplete = 33 + Math.round(((i + batchChunks.length) / totalChunks) * 66);
+          this.sendMonotonicProgress(progress, percentageComplete);
           console.info(`[${config.name}] Processed batch ${currentBatch} of ${totalBatches}. Successfully indexed in this batch: ${successfulPoints.length}. Total indexed so far: ${indexedChunks} chunks.`);
 
           // Update status after processing batch
@@ -493,6 +489,7 @@ export class LocalRepositoryHandler extends BaseHandler {
         totalChunks,
         indexedChunks
       });
+      this.sendMonotonicProgress(progress, 100);
 
       // If watch mode is enabled, start the watcher
       if (config.watchMode) {

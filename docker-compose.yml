@@ -15,5 +15,33 @@ services:
       timeout: 10s
       retries: 3
 
+  ollama:
+    image: ollama/ollama:0.5.11
+    restart: always
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_storage:/root/.ollama
+    healthcheck:
+      test: ["CMD", "ollama", "list"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  ollama-model:
+    image: ollama/ollama:0.5.11
+    depends_on:
+      ollama:
+        condition: service_healthy
+    environment:
+      OLLAMA_HOST: http://ollama:11434
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}}
+    volumes:
+      - ollama_storage:/root/.ollama
+    entrypoint: ["ollama"]
+    command: ["pull", "${EMBEDDING_MODEL:-${OLLAMA_EMBEDDING_MODEL:-nomic-embed-text}}"]
+    restart: "no"
+
 volumes:
   qdrant_storage:
+  ollama_storage:
